@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import uuid
 from requests.adapters import HTTPAdapter, Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -8,8 +9,8 @@ st.set_page_config(page_title="Verified Roblox Scout", page_icon="🎮", layout=
 
 st.title("⚡ Verified Roblox Scout")
 st.caption(
-    "Uses Roblox's real games API for visits/creation dates (not the catalog API, "
-    "which was returning unrelated data), with retries and graceful fallbacks throughout."
+    "Sources candidates from Roblox's own Discover/Charts API (real, current games — not a "
+    "third-party curated list), then verifies every one against Roblox's official games data."
 )
 
 # ---------------------------------------------------------------------------
@@ -17,16 +18,19 @@ st.caption(
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Filters")
-    min_players = st.number_input("Min live players", value=200, min_value=0)
+    min_players = st.number_input("Min live players", value=20, min_value=0)
     max_players = st.number_input("Max live players", value=2000, min_value=1)
     min_visits = st.number_input("Min total visits", value=750, min_value=0)
     max_visits = st.number_input("Max total visits", value=90000, min_value=1)
     max_age_days = st.number_input("Max age (days)", value=30, min_value=1)
     max_results = st.number_input("Max results", value=20, min_value=1, max_value=100)
     st.divider()
-    max_candidates = st.number_input(
-        "Max candidates to check", value=250, min_value=10, max_value=2000,
-        help="Caps how many games get probed per run, so a run always finishes in a reasonable time."
+    st.subheader("Candidate sources")
+    use_charts = st.checkbox("Roblox Discover/Charts (recommended)", value=True)
+    use_rolimons = st.checkbox("Rolimons active-game list (supplementary)", value=True)
+    max_rolimons_candidates = st.number_input(
+        "Max rolimons candidates to check", value=200, min_value=10, max_value=1500,
+        help="Rolimons requires one lookup call per game, so this is capped to keep runs fast."
     )
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -60,31 +64,159 @@ def parse_roblox_datetime(s):
         return None
 
 
+def first_int(d, keys):
+    """Return the first present, int-coercible value among the given keys."""
+    for k in keys:
+        v = d.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Source 1: Roblox's own Discover/Charts backend (real, current catalog)
+# ---------------------------------------------------------------------------
+def get_chart_sorts(session, session_id):
+    """
+    Discover the available chart categories (Popular, genres, etc). Response shape
+    isn't officially documented, so we parse defensively and accept several possible
+    wrapper keys rather than assuming one exact schema.
+    """
+    url = "https://apis.roblox.com/explore-api/v1/get-sorts"
+    try:
+        res = session.get(url, params={"sessionId": session_id, "device": "computer", "country": "us"}, timeout=8)
+        if res.status_code != 200:
+            return []
+        data = res.json()
+        for key in ("sorts", "Sorts", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
+
+
+def get_sort_content(session, session_id, sort_id):
+    url = "https://apis.roblox.com/explore-api/v1/get-sort-content"
+    try:
+        res = session.get(
+            url,
+            params={"sessionId": session_id, "sortId": sort_id, "device": "computer", "country": "us"},
+            timeout=8,
+        )
+        if res.status_code != 200:
+            return []
+        data = res.json()
+        for key in ("games", "Games", "data", "contents", "tiles"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
+
+
+def collect_chart_universe_ids(session, status_placeholder):
+    """
+    Pull candidates from every 'games' chart category Roblox exposes on Discover.
+    Each tile's underlying identifier is treated as a universe ID (that's the
+    convention Roblox's own game tiles use); we verify everything downstream
+    against the official games API regardless, so a wrong guess here just yields
+    zero matches for that item rather than a bad result.
+    """
+    session_id = str(uuid.uuid4())
+    sorts = get_chart_sorts(session, session_id)
+    if not sorts:
+        return set(), 0
+
+    game_sort_ids = []
+    for s in sorts:
+        if not isinstance(s, dict):
+            continue
+        content_type = str(s.get("contentType") or s.get("ContentType") or "").lower()
+        sort_id = s.get("sortId") or s.get("SortId") or s.get("id")
+        if sort_id is None:
+            continue
+        if content_type in ("", "game", "games"):
+            game_sort_ids.append(sort_id)
+
+    if not game_sort_ids:
+        return set(), 0
+
+    universe_ids = set()
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(get_sort_content, session, session_id, sid): sid for sid in game_sort_ids}
+        done = 0
+        for fut in as_completed(futures):
+            items = fut.result()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                uid = first_int(item, ["universeId", "UniverseId", "id", "contentId", "ContentId"])
+                if uid:
+                    universe_ids.add(uid)
+            done += 1
+            status_placeholder.write(f"Scanned {done}/{len(game_sort_ids)} Discover categories, "
+                                      f"{len(universe_ids)} unique games found so far...")
+
+    return universe_ids, len(game_sort_ids)
+
+
+# ---------------------------------------------------------------------------
+# Source 2: Rolimons (supplementary; requires per-game universe resolution)
+# ---------------------------------------------------------------------------
 def resolve_universe_id(session, place_id):
-    """
-    placeId -> universeId using the PUBLIC, no-auth endpoint.
-    (games.roblox.com/v1/games/multiget-place-details requires a login cookie and
-    will 401 for every single request from a server -- that was the earlier bug.)
-    Returns None on any failure; never raises.
-    """
     url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
     try:
         res = session.get(url, timeout=6)
         if res.status_code != 200:
             return None
-        data = res.json()
-        return data.get("universeId")
+        return res.json().get("universeId")
     except Exception:
         return None
 
 
+def collect_rolimons_universe_ids(session, cap):
+    try:
+        res = session.get("https://api.rolimons.com/games/v1/gamelist", timeout=8)
+        if res.status_code != 200:
+            return set(), 0, 0
+        games_dict = res.json().get("games", {})
+    except Exception:
+        return set(), 0, 0
+
+    place_ids = []
+    for pid, details in games_dict.items():
+        try:
+            place_ids.append(int(pid))
+        except Exception:
+            continue
+    place_ids = place_ids[:cap]
+
+    universe_ids = set()
+    failed = 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(resolve_universe_id, session, pid): pid for pid in place_ids}
+        for fut in as_completed(futures):
+            uid = fut.result()
+            if uid:
+                universe_ids.add(uid)
+            else:
+                failed += 1
+
+    return universe_ids, len(place_ids), failed
+
+
+# ---------------------------------------------------------------------------
+# Verification against Roblox's official games API (authoritative, always used)
+# ---------------------------------------------------------------------------
 def fetch_games_batch(session, universe_ids):
-    """
-    universeIds -> real visits / playing / created, in bulk (public, no auth).
-    Roblox's batch limit here is flaky above ~40-50 ids, so on a 400 we
-    automatically split the batch in half and retry, rather than losing the
-    whole batch.
-    """
     if not universe_ids:
         return []
     url = "https://games.roblox.com/v1/games"
@@ -94,18 +226,12 @@ def fetch_games_batch(session, universe_ids):
             return res.json().get("data", []) or []
         if res.status_code == 400 and len(universe_ids) > 1:
             mid = len(universe_ids) // 2
-            return (
-                fetch_games_batch(session, universe_ids[:mid])
-                + fetch_games_batch(session, universe_ids[mid:])
-            )
+            return fetch_games_batch(session, universe_ids[:mid]) + fetch_games_batch(session, universe_ids[mid:])
         return []
     except Exception:
         if len(universe_ids) > 1:
             mid = len(universe_ids) // 2
-            return (
-                fetch_games_batch(session, universe_ids[:mid])
-                + fetch_games_batch(session, universe_ids[mid:])
-            )
+            return fetch_games_batch(session, universe_ids[:mid]) + fetch_games_batch(session, universe_ids[mid:])
         return []
 
 
@@ -136,85 +262,48 @@ def fetch_thumbnails(session, place_ids):
 # ---------------------------------------------------------------------------
 def run_scan():
     session = make_session()
+    all_universe_ids = set()
 
-    with st.spinner("Pulling active game list from rolimons..."):
-        try:
-            res = session.get("https://api.rolimons.com/games/v1/gamelist", timeout=8)
-        except Exception as e:
-            st.error(f"Could not reach rolimons ({e}). This is usually temporary — try again in a moment.")
-            return
+    if use_charts:
+        with st.spinner("Pulling Roblox's own Discover/Charts catalog..."):
+            status = st.empty()
+            chart_ids, n_sorts = collect_chart_universe_ids(session, status)
+            status.empty()
+        st.write(f"📊 Discover/Charts: **{len(chart_ids)}** candidate games from {n_sorts} categories.")
+        all_universe_ids |= chart_ids
 
-        if res.status_code != 200:
-            st.error(f"Rolimons returned status {res.status_code}. Try again shortly.")
-            return
+    rolimons_checked = rolimons_failed = 0
+    if use_rolimons:
+        with st.spinner("Pulling rolimons' tracked game list as a supplementary source..."):
+            rolimons_ids, rolimons_checked, rolimons_failed = collect_rolimons_universe_ids(
+                session, max_rolimons_candidates
+            )
+        st.write(f"📋 Rolimons: **{len(rolimons_ids)}** resolved out of {rolimons_checked} checked.")
+        all_universe_ids |= rolimons_ids
 
-        try:
-            games_dict = res.json().get("games", {})
-        except Exception:
-            st.error("Rolimons returned unreadable data. Try again shortly.")
-            return
-
-    candidate_place_ids = []
-    for place_id, details in games_dict.items():
-        try:
-            active_players = int(details[1])
-            if min_players <= active_players <= max_players:
-                candidate_place_ids.append(int(place_id))
-        except Exception:
-            continue
-
-    if not candidate_place_ids:
-        st.warning("No active games currently sit within your player count range. Try widening it in the sidebar.")
+    if not all_universe_ids:
+        st.error(
+            "Couldn't get candidates from either source right now — this looks like a network "
+            "or availability issue on Roblox's / rolimons' side, not a filter problem. Try again shortly."
+        )
         return
 
-    candidate_place_ids = candidate_place_ids[:max_candidates]
-    st.write(f"Checking **{len(candidate_place_ids)}** candidate games against Roblox's official game data...")
+    st.write(f"Verifying **{len(all_universe_ids)}** unique games against Roblox's official data...")
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=max_age_days)
+    all_universe_ids = list(all_universe_ids)
 
     matched_games = []
-    resolved_count = 0
-    failed_count = 0
-    checked_count = 0
+    checked = 0
+    progress = st.progress(0.0, text="Verifying...")
 
-    progress = st.progress(0.0, text="Scanning...")
-    BATCH_SIZE = 25  # resolve + check candidates in adaptive batches, stop early once we have enough matches
+    for batch in chunk(all_universe_ids, 40):
+        games_info = fetch_games_batch(session, batch)
+        checked += len(batch)
+        progress.progress(min(checked / len(all_universe_ids), 1.0), text=f"Verified {checked}/{len(all_universe_ids)}...")
 
-    for batch in chunk(candidate_place_ids, BATCH_SIZE):
-        # Step 1: resolve universe IDs for this batch (public endpoint, one call per place, threaded)
-        universe_for_place = {}
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = {pool.submit(resolve_universe_id, session, pid): pid for pid in batch}
-            for fut in as_completed(futures):
-                pid = futures[fut]
-                uid = fut.result()
-                if uid:
-                    universe_for_place[pid] = uid
-                    resolved_count += 1
-                else:
-                    failed_count += 1
-
-        checked_count += len(batch)
-        progress.progress(
-            min(checked_count / len(candidate_place_ids), 1.0),
-            text=f"Scanned {checked_count}/{len(candidate_place_ids)} games..."
-        )
-
-        if not universe_for_place:
-            continue
-
-        # Step 2: pull real visits/playing/created for the resolved universe IDs, in bulk
-        universe_ids = list(set(universe_for_place.values()))
-        games_info = fetch_games_batch(session, universe_ids)
-        info_by_universe = {g.get("id"): g for g in games_info if g.get("id")}
-
-        # Step 3: apply real filters
-        for pid, uid in universe_for_place.items():
-            info = info_by_universe.get(uid)
-            if not info:
-                continue
-
+        for info in games_info:
             created_date = parse_roblox_datetime(info.get("created"))
             if not created_date or not (cutoff <= created_date <= now):
                 continue
@@ -223,11 +312,18 @@ def run_scan():
             if not (min_visits <= visits <= max_visits):
                 continue
 
-            root_place = info.get("rootPlaceId", pid)
+            playing = info.get("playing", 0)
+            if not (min_players <= playing <= max_players):
+                continue
+
+            root_place = info.get("rootPlaceId")
+            if not root_place:
+                continue
+
             matched_games.append({
                 "place_id": str(root_place),
                 "title": info.get("name", "Unknown Game"),
-                "players": info.get("playing", 0),
+                "players": playing,
                 "visits": visits,
                 "created": created_date.strftime("%b %d, %Y"),
                 "link": f"https://www.roblox.com/games/{root_place}/",
@@ -242,25 +338,19 @@ def run_scan():
     progress.empty()
 
     with st.expander("Scan diagnostics"):
-        st.write(f"Universe IDs resolved: {resolved_count}  |  Failed to resolve: {failed_count}")
-        st.write(f"Candidates checked: {checked_count} / {len(candidate_place_ids)}")
+        st.write(f"Total unique candidates verified: {len(all_universe_ids)}")
+        if use_rolimons:
+            st.write(f"Rolimons: {rolimons_checked} checked, {rolimons_failed} failed to resolve")
 
     if not matched_games:
-        if resolved_count == 0 and failed_count > 0:
-            st.error(
-                "Every universe-ID lookup failed. This usually means Roblox's public API is "
-                "temporarily unreachable from this network, or you're being rate-limited. "
-                "Wait a minute and try again — no need to change anything."
-            )
-        else:
-            st.info(
-                "No games currently satisfy every filter at once (age, visits, and live players). "
-                "This is a genuinely narrow intersection — try widening a filter in the sidebar, "
-                "raising 'Max candidates to check', or scanning again shortly."
-            )
+        st.info(
+            "No games currently satisfy every filter at once (age, visits, and live players). "
+            "Try widening a filter in the sidebar, or check more rolimons candidates — the intersection "
+            "of 'brand new' + a specific visit band + a specific live-player band is inherently narrow "
+            "at any given moment, so an empty result is a real answer, not necessarily a bug."
+        )
         return
 
-    # --- Thumbnails (cosmetic only, never fatal) ----------------------------
     thumb_map = fetch_thumbnails(session, [g["place_id"] for g in matched_games])
 
     st.success(f"Found {len(matched_games)} verified games matching your criteria.")
@@ -283,7 +373,10 @@ def run_scan():
 
 
 if st.button("🚀 Run Live Scan", type="primary"):
-    try:
-        run_scan()
-    except Exception as e:
-        st.error(f"Something unexpected went wrong ({e}). Nothing crashed — just click Run again.")
+    if not use_charts and not use_rolimons:
+        st.warning("Enable at least one candidate source in the sidebar.")
+    else:
+        try:
+            run_scan()
+        except Exception as e:
+            st.error(f"Something unexpected went wrong ({e}). Nothing crashed — just click Run again.")
