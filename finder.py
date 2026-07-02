@@ -7,9 +7,9 @@ from datetime import datetime, timedelta, timezone
 st.set_page_config(page_title="Verified Roblox Scout", page_icon="🎮", layout="centered")
 
 st.title("⚡ Verified Roblox Scout")
-st.write(
-    "Uses Roblox's own games API (not the catalog API) for real visit counts and "
-    "real creation dates, so results are actually accurate."
+st.caption(
+    "Uses Roblox's real games API for visits/creation dates (not the catalog API, "
+    "which was returning unrelated data), with retries and graceful fallbacks throughout."
 )
 
 # ---------------------------------------------------------------------------
@@ -23,6 +23,11 @@ with st.sidebar:
     max_visits = st.number_input("Max total visits", value=90000, min_value=1)
     max_age_days = st.number_input("Max age (days)", value=30, min_value=1)
     max_results = st.number_input("Max results", value=20, min_value=1, max_value=100)
+    st.divider()
+    max_candidates = st.number_input(
+        "Max candidates to check", value=250, min_value=10, max_value=2000,
+        help="Caps how many games get probed per run, so a run always finishes in a reasonable time."
+    )
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -31,11 +36,11 @@ def make_session():
     s = requests.Session()
     retries = Retry(
         total=3,
-        backoff_factor=0.5,
+        backoff_factor=0.6,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+        allowed_methods=["GET"],
     )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("https://", HTTPAdapter(max_retries=retries, pool_maxsize=20))
     s.headers.update(HEADERS)
     return s
 
@@ -55,50 +60,100 @@ def parse_roblox_datetime(s):
         return None
 
 
-def fetch_place_details_batch(session, place_ids):
-    """placeId -> universeId, via the bulk multiget endpoint (correct, official)."""
-    url = "https://games.roblox.com/v1/games/multiget-place-details"
+def resolve_universe_id(session, place_id):
+    """
+    placeId -> universeId using the PUBLIC, no-auth endpoint.
+    (games.roblox.com/v1/games/multiget-place-details requires a login cookie and
+    will 401 for every single request from a server -- that was the earlier bug.)
+    Returns None on any failure; never raises.
+    """
+    url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
     try:
-        res = session.get(url, params={"placeIds": ",".join(str(p) for p in place_ids)}, timeout=8)
+        res = session.get(url, timeout=6)
         if res.status_code != 200:
-            return []
-        return res.json() or []
+            return None
+        data = res.json()
+        return data.get("universeId")
     except Exception:
-        return []
+        return None
 
 
 def fetch_games_batch(session, universe_ids):
-    """universeId -> real visits / playing / created, via the official games endpoint."""
+    """
+    universeIds -> real visits / playing / created, in bulk (public, no auth).
+    Roblox's batch limit here is flaky above ~40-50 ids, so on a 400 we
+    automatically split the batch in half and retry, rather than losing the
+    whole batch.
+    """
+    if not universe_ids:
+        return []
     url = "https://games.roblox.com/v1/games"
     try:
         res = session.get(url, params={"universeIds": ",".join(str(u) for u in universe_ids)}, timeout=8)
-        if res.status_code != 200:
-            return []
-        return res.json().get("data", []) or []
-    except Exception:
+        if res.status_code == 200:
+            return res.json().get("data", []) or []
+        if res.status_code == 400 and len(universe_ids) > 1:
+            mid = len(universe_ids) // 2
+            return (
+                fetch_games_batch(session, universe_ids[:mid])
+                + fetch_games_batch(session, universe_ids[mid:])
+            )
         return []
+    except Exception:
+        if len(universe_ids) > 1:
+            mid = len(universe_ids) // 2
+            return (
+                fetch_games_batch(session, universe_ids[:mid])
+                + fetch_games_batch(session, universe_ids[mid:])
+            )
+        return []
+
+
+def fetch_thumbnails(session, place_ids):
+    if not place_ids:
+        return {}
+    try:
+        res = session.get(
+            "https://thumbnails.roblox.com/v1/places/icons",
+            params={
+                "placeIds": ",".join(place_ids),
+                "returnPolicy": "PlaceIcon",
+                "size": "150x150",
+                "format": "Png",
+                "isCircular": "false",
+            },
+            timeout=8,
+        )
+        if res.status_code != 200:
+            return {}
+        return {str(i.get("targetId")): i.get("imageUrl") for i in res.json().get("data", [])}
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-if st.button("🚀 Run Live Scan", type="primary"):
+def run_scan():
     session = make_session()
 
-    with st.spinner("Pulling active game list..."):
+    with st.spinner("Pulling active game list from rolimons..."):
         try:
             res = session.get("https://api.rolimons.com/games/v1/gamelist", timeout=8)
         except Exception as e:
-            st.error(f"Could not reach rolimons: {e}")
-            st.stop()
+            st.error(f"Could not reach rolimons ({e}). This is usually temporary — try again in a moment.")
+            return
 
         if res.status_code != 200:
-            st.error("Data pipeline handshake failed. Try again in a moment.")
-            st.stop()
+            st.error(f"Rolimons returned status {res.status_code}. Try again shortly.")
+            return
 
-        games_dict = res.json().get("games", {})
+        try:
+            games_dict = res.json().get("games", {})
+        except Exception:
+            st.error("Rolimons returned unreadable data. Try again shortly.")
+            return
 
-    # --- Step 1: filter candidate place IDs by live player count -----------
     candidate_place_ids = []
     for place_id, details in games_dict.items():
         try:
@@ -109,109 +164,104 @@ if st.button("🚀 Run Live Scan", type="primary"):
             continue
 
     if not candidate_place_ids:
-        st.warning("No active games currently sit within your player count range.")
-        st.stop()
+        st.warning("No active games currently sit within your player count range. Try widening it in the sidebar.")
+        return
 
-    st.write(f"Found **{len(candidate_place_ids)}** candidate games in the player range. Verifying against Roblox's official game data...")
+    candidate_place_ids = candidate_place_ids[:max_candidates]
+    st.write(f"Checking **{len(candidate_place_ids)}** candidate games against Roblox's official game data...")
 
-    # --- Step 2: placeId -> universeId, in bulk, in parallel ---------------
-    place_batches = list(chunk(candidate_place_ids, 100))
-    universe_map = {}   # placeId -> universeId
-    progress = st.progress(0.0, text="Resolving universe IDs...")
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(fetch_place_details_batch, session, b): b for b in place_batches}
-        done = 0
-        for fut in as_completed(futures):
-            for item in fut.result():
-                pid = item.get("placeId")
-                uid = item.get("universeId")
-                if pid and uid:
-                    universe_map[pid] = uid
-            done += 1
-            progress.progress(done / len(place_batches), text="Resolving universe IDs...")
-
-    if not universe_map:
-        st.error("Could not resolve any universe IDs right now. Roblox's API may be rate-limiting — try again shortly.")
-        st.stop()
-
-    # --- Step 3: universeId -> real visits/playing/created, in bulk --------
-    universe_ids = list(set(universe_map.values()))
-    universe_batches = list(chunk(universe_ids, 100))
-    game_data = {}  # universeId -> game info dict
-    progress2 = st.progress(0.0, text="Fetching verified game data...")
-
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(fetch_games_batch, session, b): b for b in universe_batches}
-        done = 0
-        for fut in as_completed(futures):
-            for item in fut.result():
-                uid = item.get("id")
-                if uid:
-                    game_data[uid] = item
-            done += 1
-            progress2.progress(done / len(universe_batches), text="Fetching verified game data...")
-
-    # --- Step 4: apply real filters (creation date + visits) ---------------
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=max_age_days)
+
     matched_games = []
+    resolved_count = 0
+    failed_count = 0
+    checked_count = 0
 
-    for place_id in candidate_place_ids:
-        uid = universe_map.get(place_id)
-        if uid is None:
-            continue
-        info = game_data.get(uid)
-        if not info:
+    progress = st.progress(0.0, text="Scanning...")
+    BATCH_SIZE = 25  # resolve + check candidates in adaptive batches, stop early once we have enough matches
+
+    for batch in chunk(candidate_place_ids, BATCH_SIZE):
+        # Step 1: resolve universe IDs for this batch (public endpoint, one call per place, threaded)
+        universe_for_place = {}
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(resolve_universe_id, session, pid): pid for pid in batch}
+            for fut in as_completed(futures):
+                pid = futures[fut]
+                uid = fut.result()
+                if uid:
+                    universe_for_place[pid] = uid
+                    resolved_count += 1
+                else:
+                    failed_count += 1
+
+        checked_count += len(batch)
+        progress.progress(
+            min(checked_count / len(candidate_place_ids), 1.0),
+            text=f"Scanned {checked_count}/{len(candidate_place_ids)} games..."
+        )
+
+        if not universe_for_place:
             continue
 
-        created_date = parse_roblox_datetime(info.get("created"))
-        if not created_date or not (cutoff <= created_date <= now):
-            continue
+        # Step 2: pull real visits/playing/created for the resolved universe IDs, in bulk
+        universe_ids = list(set(universe_for_place.values()))
+        games_info = fetch_games_batch(session, universe_ids)
+        info_by_universe = {g.get("id"): g for g in games_info if g.get("id")}
 
-        visits = info.get("visits", 0)
-        if not (min_visits <= visits <= max_visits):
-            continue
+        # Step 3: apply real filters
+        for pid, uid in universe_for_place.items():
+            info = info_by_universe.get(uid)
+            if not info:
+                continue
 
-        matched_games.append({
-            "place_id": str(info.get("rootPlaceId", place_id)),
-            "title": info.get("name", "Unknown Game"),
-            "players": info.get("playing", 0),
-            "visits": visits,
-            "created": created_date.strftime("%b %d, %Y"),
-            "link": f"https://www.roblox.com/games/{info.get('rootPlaceId', place_id)}/",
-        })
+            created_date = parse_roblox_datetime(info.get("created"))
+            if not created_date or not (cutoff <= created_date <= now):
+                continue
+
+            visits = info.get("visits", 0)
+            if not (min_visits <= visits <= max_visits):
+                continue
+
+            root_place = info.get("rootPlaceId", pid)
+            matched_games.append({
+                "place_id": str(root_place),
+                "title": info.get("name", "Unknown Game"),
+                "players": info.get("playing", 0),
+                "visits": visits,
+                "created": created_date.strftime("%b %d, %Y"),
+                "link": f"https://www.roblox.com/games/{root_place}/",
+            })
+
+            if len(matched_games) >= max_results:
+                break
 
         if len(matched_games) >= max_results:
             break
 
-    if not matched_games:
-        st.info(
-            "No games currently satisfy every filter at once (age, visits, and live players). "
-            "This is a genuinely narrow intersection — try widening a filter in the sidebar or scanning again shortly."
-        )
-        st.stop()
+    progress.empty()
 
-    # --- Step 5: thumbnails, bulk ------------------------------------------
-    final_ids = [g["place_id"] for g in matched_games]
-    thumb_map = {}
-    try:
-        thumb_res = session.get(
-            "https://thumbnails.roblox.com/v1/places/icons",
-            params={
-                "placeIds": ",".join(final_ids),
-                "returnPolicy": "PlaceIcon",
-                "size": "150x150",
-                "format": "Png",
-                "isCircular": "false",
-            },
-            timeout=8,
-        )
-        if thumb_res.status_code == 200:
-            for item in thumb_res.json().get("data", []):
-                thumb_map[str(item.get("targetId"))] = item.get("imageUrl")
-    except Exception:
-        pass  # thumbnails are cosmetic; don't fail the whole run over them
+    with st.expander("Scan diagnostics"):
+        st.write(f"Universe IDs resolved: {resolved_count}  |  Failed to resolve: {failed_count}")
+        st.write(f"Candidates checked: {checked_count} / {len(candidate_place_ids)}")
+
+    if not matched_games:
+        if resolved_count == 0 and failed_count > 0:
+            st.error(
+                "Every universe-ID lookup failed. This usually means Roblox's public API is "
+                "temporarily unreachable from this network, or you're being rate-limited. "
+                "Wait a minute and try again — no need to change anything."
+            )
+        else:
+            st.info(
+                "No games currently satisfy every filter at once (age, visits, and live players). "
+                "This is a genuinely narrow intersection — try widening a filter in the sidebar, "
+                "raising 'Max candidates to check', or scanning again shortly."
+            )
+        return
+
+    # --- Thumbnails (cosmetic only, never fatal) ----------------------------
+    thumb_map = fetch_thumbnails(session, [g["place_id"] for g in matched_games])
 
     st.success(f"Found {len(matched_games)} verified games matching your criteria.")
     st.divider()
@@ -230,3 +280,10 @@ if st.button("🚀 Run Live Scan", type="primary"):
             st.write(f"👥 **Live Players:** {game['players']:,} | 📈 **Total Visits:** {game['visits']:,}")
             st.markdown(f"[👉 Click to Play Game]({game['link']})")
         st.divider()
+
+
+if st.button("🚀 Run Live Scan", type="primary"):
+    try:
+        run_scan()
+    except Exception as e:
+        st.error(f"Something unexpected went wrong ({e}). Nothing crashed — just click Run again.")
