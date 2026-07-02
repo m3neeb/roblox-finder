@@ -9,8 +9,8 @@ st.set_page_config(page_title="Verified Roblox Scout", page_icon="🎮", layout=
 
 st.title("⚡ Verified Roblox Scout")
 st.caption(
-    "Sources candidates from Roblox's own Discover/Charts API (real, current games — not a "
-    "third-party curated list), then verifies every one against Roblox's official games data."
+    "Sources candidates from Roblox's own Discover/Charts genre sorts (the same public "
+    "data RoTrends and similar sites are built on), verified against Roblox's official games API."
 )
 
 # ---------------------------------------------------------------------------
@@ -23,7 +23,8 @@ with st.sidebar:
     min_visits = st.number_input("Min total visits", value=750, min_value=0)
     max_visits = st.number_input("Max total visits", value=90000, min_value=1)
     max_age_days = st.number_input("Max age (days)", value=30, min_value=1)
-    max_results = st.number_input("Max results", value=20, min_value=1, max_value=100)
+    max_results = st.number_input("Max results", value=20, min_value=1, max_value=200)
+
     st.divider()
     st.subheader("Candidate sources")
     use_charts = st.checkbox("Roblox Discover/Charts (recommended)", value=True)
@@ -33,10 +34,27 @@ with st.sidebar:
         help="Rolimons requires one lookup call per game, so this is capped to keep runs fast."
     )
 
+    st.divider()
+    st.subheader("Optional: unlock full chart results")
+    st.caption(
+        "Roblox's own Discover/Charts API silently hides some experiences from requests that "
+        "aren't logged in (confirmed by RoTrends' developer on the Roblox dev forum). Pasting "
+        "your account's .ROBLOSECURITY cookie here makes chart requests look logged-in, which "
+        "surfaces the full result set instead of a filtered subset. **This is optional** — the "
+        "scan still runs without it, just against fewer visible candidates."
+    )
+    st.caption(
+        "⚠️ This cookie is equivalent to your Roblox login — treat it like a password. It's used "
+        "only in-memory for this session's requests to roblox.com domains, never logged, stored, "
+        "or sent anywhere else. Use a throwaway/alt account if you're at all unsure. Heavy automated "
+        "use of your own session also isn't something Roblox's ToS is built around, so keep runs occasional."
+    )
+    roblosecurity = st.text_input(".ROBLOSECURITY cookie (optional)", value="", type="password")
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 
-def make_session():
+def make_session(cookie_value):
     s = requests.Session()
     retries = Retry(
         total=3,
@@ -46,6 +64,10 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=retries, pool_maxsize=20))
     s.headers.update(HEADERS)
+    if cookie_value:
+        # Scoped to .roblox.com only -- requests will not send this to rolimons.com
+        # or any other domain, since cookie domain matching is enforced by the jar.
+        s.cookies.set(".ROBLOSECURITY", cookie_value, domain=".roblox.com")
     return s
 
 
@@ -65,7 +87,6 @@ def parse_roblox_datetime(s):
 
 
 def first_int(d, keys):
-    """Return the first present, int-coercible value among the given keys."""
     for k in keys:
         v = d.get(k)
         if v is not None:
@@ -77,14 +98,9 @@ def first_int(d, keys):
 
 
 # ---------------------------------------------------------------------------
-# Source 1: Roblox's own Discover/Charts backend (real, current catalog)
+# Source 1: Roblox's own Discover/Charts backend
 # ---------------------------------------------------------------------------
 def get_chart_sorts(session, session_id):
-    """
-    Discover the available chart categories (Popular, genres, etc). Response shape
-    isn't officially documented, so we parse defensively and accept several possible
-    wrapper keys rather than assuming one exact schema.
-    """
     url = "https://apis.roblox.com/explore-api/v1/get-sorts"
     try:
         res = session.get(url, params={"sessionId": session_id, "device": "computer", "country": "us"}, timeout=8)
@@ -123,13 +139,6 @@ def get_sort_content(session, session_id, sort_id):
 
 
 def collect_chart_universe_ids(session, status_placeholder):
-    """
-    Pull candidates from every 'games' chart category Roblox exposes on Discover.
-    Each tile's underlying identifier is treated as a universe ID (that's the
-    convention Roblox's own game tiles use); we verify everything downstream
-    against the official games API regardless, so a wrong guess here just yields
-    zero matches for that item rather than a bad result.
-    """
     session_id = str(uuid.uuid4())
     sorts = get_chart_sorts(session, session_id)
     if not sorts:
@@ -162,14 +171,16 @@ def collect_chart_universe_ids(session, status_placeholder):
                 if uid:
                     universe_ids.add(uid)
             done += 1
-            status_placeholder.write(f"Scanned {done}/{len(game_sort_ids)} Discover categories, "
-                                      f"{len(universe_ids)} unique games found so far...")
+            status_placeholder.write(
+                f"Scanned {done}/{len(game_sort_ids)} Discover categories, "
+                f"{len(universe_ids)} unique games found so far..."
+            )
 
     return universe_ids, len(game_sort_ids)
 
 
 # ---------------------------------------------------------------------------
-# Source 2: Rolimons (supplementary; requires per-game universe resolution)
+# Source 2: Rolimons (supplementary)
 # ---------------------------------------------------------------------------
 def resolve_universe_id(session, place_id):
     url = f"https://apis.roblox.com/universes/v1/places/{place_id}/universe"
@@ -192,7 +203,7 @@ def collect_rolimons_universe_ids(session, cap):
         return set(), 0, 0
 
     place_ids = []
-    for pid, details in games_dict.items():
+    for pid in games_dict.keys():
         try:
             place_ids.append(int(pid))
         except Exception:
@@ -214,7 +225,7 @@ def collect_rolimons_universe_ids(session, cap):
 
 
 # ---------------------------------------------------------------------------
-# Verification against Roblox's official games API (authoritative, always used)
+# Verification against Roblox's official games API
 # ---------------------------------------------------------------------------
 def fetch_games_batch(session, universe_ids):
     if not universe_ids:
@@ -261,7 +272,7 @@ def fetch_thumbnails(session, place_ids):
 # Main
 # ---------------------------------------------------------------------------
 def run_scan():
-    session = make_session()
+    session = make_session(roblosecurity.strip() if roblosecurity else None)
     all_universe_ids = set()
 
     if use_charts:
@@ -269,7 +280,8 @@ def run_scan():
             status = st.empty()
             chart_ids, n_sorts = collect_chart_universe_ids(session, status)
             status.empty()
-        st.write(f"📊 Discover/Charts: **{len(chart_ids)}** candidate games from {n_sorts} categories.")
+        auth_note = " (logged-in view)" if roblosecurity else " (anonymous view — some experiences may be hidden)"
+        st.write(f"📊 Discover/Charts{auth_note}: **{len(chart_ids)}** candidate games from {n_sorts} categories.")
         all_universe_ids |= chart_ids
 
     rolimons_checked = rolimons_failed = 0
@@ -284,7 +296,7 @@ def run_scan():
     if not all_universe_ids:
         st.error(
             "Couldn't get candidates from either source right now — this looks like a network "
-            "or availability issue on Roblox's / rolimons' side, not a filter problem. Try again shortly."
+            "or availability issue, not a filter problem. Try again shortly."
         )
         return
 
@@ -329,25 +341,27 @@ def run_scan():
                 "link": f"https://www.roblox.com/games/{root_place}/",
             })
 
-            if len(matched_games) >= max_results:
-                break
-
         if len(matched_games) >= max_results:
             break
 
     progress.empty()
+    matched_games = matched_games[:max_results]
 
     with st.expander("Scan diagnostics"):
         st.write(f"Total unique candidates verified: {len(all_universe_ids)}")
+        st.write(f"Used logged-in chart access: {'Yes' if roblosecurity else 'No'}")
         if use_rolimons:
             st.write(f"Rolimons: {rolimons_checked} checked, {rolimons_failed} failed to resolve")
 
     if not matched_games:
+        tip = (
+            "Try adding your .ROBLOSECURITY cookie in the sidebar — Roblox hides some chart results "
+            "from anonymous requests, which is the single biggest lever for finding more matches. "
+        ) if not roblosecurity else ""
         st.info(
-            "No games currently satisfy every filter at once (age, visits, and live players). "
-            "Try widening a filter in the sidebar, or check more rolimons candidates — the intersection "
-            "of 'brand new' + a specific visit band + a specific live-player band is inherently narrow "
-            "at any given moment, so an empty result is a real answer, not necessarily a bug."
+            f"No games currently satisfy every filter at once (age, visits, and live players). {tip}"
+            "You can also widen a filter in the sidebar — the intersection of 'brand new' + a specific "
+            "visit band + a specific live-player band, all at this exact moment, is inherently narrow."
         )
         return
 
